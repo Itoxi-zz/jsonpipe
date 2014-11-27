@@ -1,11 +1,8 @@
 package jsonpipe
 
-import (
-	"encoding/json"
-)
-
 type Request struct {
-	Action string           `json:"action"`
-	ReqId  string           `json:"reqId"`
-	Data   *json.RawMessage `json:"data"`
+	Action    string                 `json:"action"`
+	Error     error                  `json:"error,omitempty"`
+	RequestId string                 `json:"reqId"`
+	Data      map[string]interface{} `json:"data"`
 }

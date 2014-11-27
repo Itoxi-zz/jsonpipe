@@ -3,137 +3,119 @@ package jsonpipe
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"runtime/debug"
-)
-
-const (
-	//	4 megabytes
-	MaxScanTokenSize = 4 * 1024 * 1024
 )
 
 type Server struct {
-	Conn     net.Conn
-	Reader   *bufio.Reader
-	Encoder  *json.Encoder
-	LineData []byte
+	ActionRegistry map[string]Action
+	Reader         *bufio.Reader
+	Encoder        *json.Encoder
 }
 
-func (server *Server) Read() {
-	for {
-		var err error
-		lineData, isPrefix, err := server.Reader.ReadLine()
-		if err == io.EOF {
-			log.Println("server disconnected: " + server.Conn.RemoteAddr().String())
-			server.Conn.Close()
-			break
-		}
+type Message struct {
+	Connection net.Conn
+	Data       []byte
+}
 
-		if err != nil {
-			log.Println("reader error: ", err)
-			continue
-		}
+type Action struct {
+	Handler Handler
+	Pattern string
+}
 
-		if isPrefix {
-			server.LineData = append(server.LineData, lineData...)
+func NewServer() *Server {
+	server := Server{
+		ActionRegistry: make(map[string]Action),
+	}
+	return &server
+}
 
-			//	check if the request is larger than our max allowed size.
-			//	if so, we are probably being flooded, kill the connection
-			if len(server.LineData) > MaxScanTokenSize {
-				log.Println("connection flood detected. closing connection")
-				server.Conn.Close()
-				break
-			}
-			continue
-		}
+func (s Server) Handle(action string, handler Handler) {
+	if len(action) < 1 {
+		log.Println("Error registering handler: pattern string is required")
+	}
+	s.ActionRegistry[action] = Action{Pattern: action, Handler: handler}
+}
 
-		server.LineData = append(server.LineData, lineData...)
-		server.Decode()
+func (s Server) ListenAndServe(port string) {
 
-		//	reset our line slice
-		server.LineData = []byte{}
+	allClients := make(map[net.Conn]string) //map of all clients keyed on their connection
+	newConnections := make(chan net.Conn)   //channel for incoming connections
+	deadConnections := make(chan net.Conn)  //channel for dead connections
+	messages := make(chan Message)          //channel for messages
+
+	server, err := net.Listen("tcp", port)
+	if err != nil {
+		fmt.Println(err)
 	}
 
-	//	end go routine
-	return
+	log.Printf("JSON Pipe Server listening on %s\n", port)
+
+	go acceptConnections(server, newConnections)
+
+	for {
+		select {
+		case conn := <-newConnections:
+			addr := conn.RemoteAddr().String()
+			log.Printf("Accepted new client, %v", addr)
+			allClients[conn] = addr
+			go read(conn, messages, deadConnections)
+		case conn := <-deadConnections:
+			log.Printf("Client %v disconnected", allClients[conn])
+			delete(allClients, conn)
+		case message := <-messages:
+			go s.HandleRequest(message)
+		}
+	}
+
 }
 
-func (server *Server) Decode() {
-	var err error
-	var req Request
-	err = json.Unmarshal(server.LineData, &req)
-	if err != nil {
-		log.Println(err)
-
-		res := Response{
-			ReqId:   "error",
-			Success: false,
-			Error:   "JSON decode fail: " + err.Error(),
-		}
-
-		err = server.Encoder.Encode(res)
+func acceptConnections(server net.Listener, newConnections chan net.Conn) {
+	for {
+		conn, err := server.Accept()
 		if err != nil {
-			log.Println(err)
+			fmt.Println(err)
 		}
+		newConnections <- conn
+	}
+}
+
+func read(conn net.Conn, messages chan Message, deadConnections chan net.Conn) {
+	reader := bufio.NewReader(conn)
+	for {
+		incoming, err := reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		messages <- Message{conn, []byte(incoming)}
+	}
+	deadConnections <- conn
+}
+
+func (server Server) HandleRequest(msg Message) {
+
+	response := Response{}
+	request := Request{}
+
+	if err := json.Unmarshal(msg.Data, &request); err != nil {
+		log.Println("Error decoding JSON:" + err.Error())
+	}
+
+	if action, ok := server.ActionRegistry[request.Action]; ok { //Get the handler for this action
+		response = action.Handler.Run(&request)
+	} else {
+		response.Error = errors.New(fmt.Sprintf("No handler registered for %s", request.Action))
+	}
+
+	bytes, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("Error marshaling JSON:%s\n", err)
 		return
 	}
 
-	fmt.Printf("%+v \n", req)
+	msg.Connection.Write(bytes)
 
-	//	recover if our go routine crashes
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println(debug.Stack())
-		}
-	}()
-
-	//	log.Println(runtime.NumGoroutine())
-
-	//	make request concurrent
-	go server.HandleRequest(&req)
-}
-
-func (server *Server) HandleRequest(req *Request) {
-	var err error
-	var res Response
-
-	if req.Data == nil {
-		res = Response{
-			ReqId:   req.ReqId,
-			Success: false,
-			Error:   "no request data provided",
-		}
-	} else {
-		//		data, err := req.HandleAction()
-		data, err := Pipe.actions[req.Action].h(req.Data)
-		if err != nil {
-			res = Response{
-				ReqId:   req.ReqId,
-				Success: false,
-				Error:   err.Error(),
-			}
-		} else {
-			//	success!
-			res = Response{
-				ReqId:   req.ReqId,
-				Success: true,
-				Data:    data,
-			}
-		}
-	}
-
-	log.Printf("Res: %+v \n", res)
-
-	err = server.Encoder.Encode(&res)
-	if err != nil {
-		log.Println("Encoder error: ", err)
-	}
-
-	//	TODO: remove request data
-
-	//	end go routine
 	return
 }
