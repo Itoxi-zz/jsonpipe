@@ -9,3 +9,8 @@ then in a separate shell window:
 `go run example/example_client.go`
 
 Also restructured connection management to handle hundreds of concurrent connections safely.
+
+TODO
+========
+ * Write some unit tests
+ * More docs/examples
